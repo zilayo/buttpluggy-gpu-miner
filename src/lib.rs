@@ -4,13 +4,18 @@
 use alloy_primitives::{hex, FixedBytes};
 use byteorder::{BigEndian, ByteOrder, LittleEndian};
 use console::Term;
+use ethers::utils::keccak256;
+use eyre::Result;
 use fs4::FileExt;
 use ocl::{Buffer, Context, Device, MemFlags, Platform, ProQue, Program, Queue};
 use rand::{thread_rng, Rng};
+use rayon::prelude::*;
 use separator::Separatable;
 use std::fmt::Write as _;
 use std::fs::{File, OpenOptions};
 use std::io::prelude::*;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 use terminal_size::{terminal_size, Height};
 use tiny_keccak::{Hasher, Keccak};
@@ -21,6 +26,8 @@ const WORK_SIZE: u32 = 0x4000000; // max. 0x15400000 to abs. max 0xffffffff
 const WORK_FACTOR: u128 = (WORK_SIZE as u128) / 1_000_000;
 
 static KERNEL_SRC: &str = include_str!("./kernels/keccak256.cl");
+
+const BATCH_SIZE: u64 = 5_000_000;
 
 pub struct Config {
     pub calling_address: [u8; 20],
@@ -45,7 +52,7 @@ impl Config {
         };
         let gpu_device_string = match args.next() {
             Some(arg) => arg,
-            None => String::from("0"), // default to device 0
+            None => String::from("255"),
         };
 
         // convert main arguments from hex string to vector of bytes
@@ -85,7 +92,57 @@ impl Config {
     }
 }
 
+pub fn cpu(config: Config) -> Result<()> {
+    println!("Started CPU miner");
+    let file = Arc::new(Mutex::new(output_file()));
+
+    let found = Arc::new(AtomicBool::new(false));
+    let total_batches = u64::MAX / BATCH_SIZE;
+
+    (0..total_batches).into_par_iter().for_each(|batch_index| {
+        if found.load(Ordering::Relaxed) {
+            return;
+        }
+
+        let start_nonce = batch_index * BATCH_SIZE;
+        let end_nonce = start_nonce + BATCH_SIZE;
+
+        for nonce in start_nonce..end_nonce {
+            let nonce_bytes = nonce.to_be_bytes();
+            let mut data = Vec::with_capacity(
+                config.calling_address.len() + config.salt.len() + nonce_bytes.len(),
+            );
+
+            data.extend_from_slice(&config.calling_address);
+            data.extend_from_slice(&config.salt);
+            data.extend_from_slice(&nonce_bytes);
+            let hash = keccak256(&data);
+
+            if hash.starts_with(&[0u8; 10]) {
+                let output = format!(
+                    "Found nonce: {}\nSalt: {:?}\nHash: {:?}\n",
+                    nonce,
+                    hex::encode(config.salt),
+                    hex::encode(hash)
+                );
+                println!("{}", output);
+
+                let mut file = file.lock().unwrap();
+                writeln!(file, "{}", output).expect("Failed to write to file.");
+                break;
+            }
+        }
+    });
+
+    if !found.load(Ordering::Relaxed) {
+        println!("Failed to find nonce");
+    }
+
+    Ok(())
+}
+
 pub fn gpu(config: Config) -> ocl::Result<()> {
+    println!("Started GPU miner");
     // (create if necessary) and open a file where found salts will be written
     let file = output_file();
 
